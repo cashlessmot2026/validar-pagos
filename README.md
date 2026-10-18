@@ -16,9 +16,20 @@ PWA en React para validar pagos recibidos por Nequi **sin usar APIs de bancos**.
 - **Permisos del celular:** notificaciones, voz, cámara, portapapeles, almacenamiento persistente, pantalla encendida e instalación de la app.
 - **Compartir (share target):** comparte un SMS o un pantallazo de WhatsApp directamente con la app.
 
+## Usuarios y roles
+| Usuario | Contraseña inicial | Rol | Ve |
+|---|---|---|---|
+| `admin` | `1234` | Administrador | Analítica, Caja, Validar, Movimientos (entradas y salidas), Usuarios e integraciones |
+| `v` | `1234` | Trabajador | **Caja** (escucha en vivo los pagos recibidos), **Validar** pantallazos y Ajustes |
+
+- El trabajador **no necesita acceso al correo ni al celular**: la app le muestra y le lee en voz alta cada pago recibido, desde cualquier dispositivo.
+- El trabajador **no ve salidas de dinero**, solo los pagos recibidos de los últimos 3 días, y **no puede registrar movimientos manualmente**.
+- El trabajador solo puede aprobar pagos confirmados por un canal oficial (el correo de Gmail o el SMS reenviado con el secreto).
+- Las contraseñas se guardan cifradas (bcrypt). Tras 5 intentos fallidos el usuario se bloquea 5 minutos. **Cambia las contraseñas `1234`** desde Ajustes.
+
 ## Instalación
-1. **Base de datos.** En Supabase abre SQL Editor y ejecuta `supabase/schema.sql`.
-2. **Usuario.** En Supabase ve a Authentication → Users → Add user. Luego desactiva el registro público en Authentication → Providers.
+1. **Base de datos.** En Supabase abre SQL Editor y ejecuta, en este orden, `supabase/schema.sql` y `supabase/02_usuarios_roles.sql`.
+2. **Usuarios.** Ya quedan creados `admin` y `v`. Puedes crear más trabajadores en Ajustes → Usuarios.
 3. **Gmail.** Sigue las instrucciones del archivo `integraciones/gmail-apps-script.gs`. El secreto se obtiene con:
    ```sql
    select value from public.app_config where key = 'ingest_secret';

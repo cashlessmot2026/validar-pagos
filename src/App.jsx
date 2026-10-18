@@ -12,7 +12,22 @@ import {
 const SUPABASE_URL = import.meta.env.VITE_SUPABASE_URL || 'https://wzeycwyumbsbeytypzal.supabase.co';
 const SUPABASE_ANON_KEY = import.meta.env.VITE_SUPABASE_ANON_KEY ||
   'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Ind6ZXljd3l1bWJzYmV5dHlwemFsIiwicm9sZSI6ImFub24iLCJpYXQiOjE3OTIzNDUyMjIsImV4cCI6MjEwNzkyMTIyMn0.0XtsUOx90wQrCI1t5el848fvRzx66LeP3yMtsEkiPPM';
-const supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
+const supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY, { auth: { persistSession: false, autoRefreshToken: false } });
+
+// Todas las operaciones pasan por funciones RPC que validan la sesión (usuario/contraseña propios)
+async function rpc(fn, args) {
+  const { data, error } = await supabase.rpc(fn, args);
+  if (error) {
+    if (/SESION_EXPIRADA/.test(error.message)) window.dispatchEvent(new Event('vp-logout'));
+    throw new Error(error.message);
+  }
+  return data;
+}
+const mergeById = (prev, next, key) => {
+  const map = new Map(prev.map((x) => [x.id, x]));
+  next.forEach((x) => map.set(x.id, x));
+  return [...map.values()].sort((a, b) => String(b[key]).localeCompare(String(a[key])));
+};
 
 const AUTHORIZED = {
   in: 'notificaciones@nequi.com.co',
@@ -266,21 +281,19 @@ function MovementRow({ n, i = 0 }) {
 /* =====================================================================
    LOGIN
    ===================================================================== */
-function Login() {
-  const [email, setEmail] = useState('');
+function Login({ onLogin }) {
+  const [username, setUsername] = useState('');
   const [password, setPassword] = useState('');
-  const [mode, setMode] = useState('in');
   const [msg, setMsg] = useState('');
   const [busy, setBusy] = useState(false);
   const submit = async (e) => {
     e.preventDefault();
     setBusy(true); setMsg('');
-    const { error } = mode === 'in'
-      ? await supabase.auth.signInWithPassword({ email, password })
-      : await supabase.auth.signUp({ email, password });
+    try {
+      const d = await rpc('app_login', { p_username: username, p_password: password });
+      if (d?.ok) onLogin(d); else setMsg(d?.error || 'No se pudo iniciar sesión');
+    } catch (err) { setMsg(err.message); }
     setBusy(false);
-    if (error) setMsg(error.message);
-    else if (mode === 'up') setMsg('Cuenta creada. Revisa tu correo si se requiere confirmación.');
   };
   return (
     <div className="wrap" style={{ display: 'grid', placeItems: 'center', minHeight: '100vh' }}>
@@ -290,17 +303,15 @@ function Login() {
         <h2 style={{ textAlign: 'center', marginBottom: 4 }}>Validar Pagos</h2>
         <p className="muted" style={{ textAlign: 'center', marginBottom: 12 }}>Analítica y validación de pagos Nequi</p>
         <form onSubmit={submit}>
-          <label className="f">Correo</label>
-          <input type="email" required value={email} onChange={(e) => setEmail(e.target.value)} autoComplete="email" />
+          <label className="f">Usuario</label>
+          <input required value={username} onChange={(e) => setUsername(e.target.value)} autoComplete="username" autoCapitalize="none" />
           <label className="f">Contraseña</label>
-          <input type="password" required minLength={6} value={password} onChange={(e) => setPassword(e.target.value)}
-            autoComplete={mode === 'in' ? 'current-password' : 'new-password'} />
-          <button className="btn full" style={{ marginTop: 16 }} disabled={busy}>{busy ? 'Un momento…' : mode === 'in' ? 'Entrar' : 'Crear cuenta'}</button>
+          <input type="password" required value={password} onChange={(e) => setPassword(e.target.value)} autoComplete="current-password" />
+          <button className="btn full" style={{ marginTop: 16 }} disabled={busy}>{busy ? 'Un momento…' : 'Entrar'}</button>
         </form>
-        {msg && <p className="muted" style={{ marginTop: 10 }}>{msg}</p>}
-        <button className="btn ghost full" style={{ marginTop: 10 }} onClick={() => setMode(mode === 'in' ? 'up' : 'in')}>
-          {mode === 'in' ? 'Crear una cuenta' : 'Ya tengo cuenta'}
-        </button>
+        <AnimatePresence>
+          {msg && <motion.p className="muted" style={{ marginTop: 10, color: 'var(--bad)' }} initial={{ opacity: 0, x: -10 }} animate={{ opacity: 1, x: [0, -6, 6, 0] }} exit={{ opacity: 0 }}>{msg}</motion.p>}
+        </AnimatePresence>
       </Card>
     </div>
   );
@@ -485,7 +496,8 @@ function Dashboard({ notifs, vals }) {
 /* =====================================================================
    VALIDAR PANTALLAZO
    ===================================================================== */
-function Validator({ sharedFile, onConsumed, toast }) {
+function Validator({ session, sharedFile, onConsumed, toast }) {
+  const isAdmin = session.role === 'admin';
   const [file, setFile] = useState(null);
   const [preview, setPreview] = useState('');
   const [progress, setProgress] = useState(0);
@@ -504,33 +516,32 @@ function Validator({ sharedFile, onConsumed, toast }) {
       setResult({ status: 'revisar', score: 0, checks: [{ ok: null, t: 'Datos incompletos', d: 'Completa valor, fecha y hora del comprobante.' }] });
       return;
     }
-    const minute = new Date(occurredISO);
-    const exactFrom = minute.toISOString();
-    const exactTo = new Date(minute.getTime() + 59999).toISOString();
-    const nearFrom = new Date(minute.getTime() - 15 * 60000).toISOString();
-    const nearTo = new Date(minute.getTime() + 15 * 60000).toISOString();
+    const minute = new Date(occurredISO).getTime();
 
-    const [{ data: cands, error }, { data: dupImg }, { data: dupRef }] = await Promise.all([
-      supabase.from('notifications').select('*').eq('direction', 'in').eq('amount', amount)
-        .gte('occurred_at', nearFrom).lte('occurred_at', nearTo).order('occurred_at'),
-      imgHash ? supabase.from('validations').select('id,created_at').eq('image_hash', imgHash).eq('status', 'aprobado').limit(1) : { data: [] },
-      f.reference ? supabase.from('validations').select('id,created_at').ilike('reference', f.reference).eq('status', 'aprobado').limit(1) : { data: [] },
-    ]);
-    if (error) { toast('Error consultando: ' + error.message); return; }
+    let lookup;
+    try {
+      lookup = await rpc('validation_lookup', {
+        p_token: session.token, p_amount: amount, p_occurred_at: occurredISO,
+        p_image_hash: imgHash || null, p_reference: f.reference || null,
+      });
+    } catch (e) { toast('Error consultando: ' + e.message); return; }
 
-    const ranked = (cands || []).map((n) => ({
-      n,
-      exact: n.occurred_at >= exactFrom && n.occurred_at <= exactTo,
-      name: nameScore(n.counterparty, f.name, text),
-    })).sort((a, b) => (b.exact - a.exact) || (a.n.validated - b.n.validated) || (b.name - a.name));
+    const ranked = (lookup.candidates || []).map((n) => {
+      const t = new Date(n.occurred_at).getTime();
+      return { n, exact: t >= minute && t < minute + 60000, name: nameScore(n.counterparty, f.name, text) };
+    }).sort((a, b) => (b.exact - a.exact) || (a.n.validated - b.n.validated) || (b.name - a.name));
     const best = ranked[0];
+    const dupImg = lookup.dup_image;
+    const dupRef = lookup.dup_reference;
 
     const checks = [];
-    checks.push(best
-      ? { ok: best.n.verified ? true : null, t: 'Origen de la notificación',
-        d: best.n.verified ? `Correo de ${AUTHORIZED.in} con firma DKIM/DMARC válida`
-          : `Solo por ${best.n.channels?.join(', ') || best.n.channel}; aún no llega el correo verificado` }
-      : { ok: false, t: 'Notificación de Nequi', d: `No hay un pago recibido de ${fmtCOP(amount)} cerca de ${f.time}` });
+    checks.push(!best
+      ? { ok: false, t: 'Notificación de Nequi', d: `No hay un pago recibido de ${fmtCOP(amount)} cerca de ${f.time}` }
+      : best.n.verified
+        ? { ok: true, t: 'Origen de la notificación', d: `Correo de ${AUTHORIZED.in} con firma DKIM/DMARC válida` }
+        : best.n.trusted
+          ? { ok: null, t: 'Origen de la notificación', d: 'Confirmado por SMS de Nequi; el correo verificado aún no llega' }
+          : { ok: isAdmin ? null : false, t: 'Origen de la notificación', d: 'Registrado manualmente, sin confirmación oficial de Nequi todavía' });
     if (best) {
       checks.push({ ok: Number(best.n.amount) === amount, t: 'Valor exacto', d: `Comprobante ${fmtCOP(amount)} · Nequi ${fmtCOP(best.n.amount)}` });
       checks.push({ ok: best.exact, t: 'Hora exacta', d: `Comprobante ${f.date} ${f.time} · Nequi ${bogota(best.n.occurred_at).date} ${bogota(best.n.occurred_at).time}` });
@@ -542,15 +553,15 @@ function Validator({ sharedFile, onConsumed, toast }) {
       }
     }
     checks.push(f.reference
-      ? { ok: !dupRef?.length, t: 'Número de movimiento único', d: dupRef?.length ? `${f.reference} ya fue usado` : `${f.reference} no se ha usado` }
+      ? { ok: !dupRef, t: 'Número de movimiento único', d: dupRef ? `${f.reference} ya fue usado` : `${f.reference} no se ha usado` }
       : { ok: null, t: 'Número de movimiento', d: 'No se detectó en el pantallazo' });
-    checks.push({ ok: !dupImg?.length, t: 'Pantallazo nuevo', d: dupImg?.length ? 'Esta misma imagen ya fue presentada' : 'Imagen nunca antes usada' });
+    checks.push({ ok: !dupImg, t: 'Pantallazo nuevo', d: dupImg ? 'Esta misma imagen ya fue presentada' : 'Imagen nunca antes usada' });
 
     const hardFail = checks.some((c) => c.ok === false);
     const score = Math.round((checks.filter((c) => c.ok === true).length / checks.length) * 100);
     const status = hardFail ? 'rechazado' : checks.every((c) => c.ok === true) ? 'aprobado' : 'revisar';
     setResult({ status, score, checks, best: best?.n, occurredISO });
-  }, [toast]);
+  }, [toast, session.token, isAdmin]);
 
   const processFile = useCallback(async (f) => {
     if (!f) return;
@@ -580,6 +591,7 @@ function Validator({ sharedFile, onConsumed, toast }) {
   const register = async (status) => {
     setBusy(true);
     const { error } = await supabase.rpc('register_validation', {
+      p_token: session.token,
       p_notification_id: result?.best?.id || null,
       p_status: status,
       p_score: result?.score || 0,
@@ -686,7 +698,7 @@ function Validator({ sharedFile, onConsumed, toast }) {
 /* =====================================================================
    MOVIMIENTOS + INGRESO MANUAL DE SMS / CORREO
    ===================================================================== */
-function Movements({ notifs, toast, sharedText, onConsumed }) {
+function Movements({ session, notifs, toast, sharedText, onConsumed }) {
   const [filter, setFilter] = useState('all');
   const [q, setQ] = useState('');
   const [text, setText] = useState('');
@@ -695,12 +707,13 @@ function Movements({ notifs, toast, sharedText, onConsumed }) {
   const ingest = useCallback(async (raw, channel) => {
     if (!raw?.trim()) return;
     setBusy(true);
-    const { data, error } = await supabase.rpc('ingest_notification', { p_raw: raw, p_channel: channel });
+    try {
+      const data = await rpc('ingest_notification', { p_raw: raw, p_channel: channel, p_token: session.token });
+      if (!data?.ok) toast('⚠️ ' + data?.error);
+      else { toast(data.new ? '✅ Movimiento registrado' : 'ℹ️ Ya estaba registrado'); setText(''); }
+    } catch (e) { toast('⚠️ ' + e.message); }
     setBusy(false);
-    if (error) toast('⚠️ ' + error.message);
-    else if (!data?.ok) toast('⚠️ ' + data?.error);
-    else { toast(data.new ? '✅ Movimiento registrado' : 'ℹ️ Ya estaba registrado'); setText(''); }
-  }, [toast]);
+  }, [toast, session.token]);
 
   useEffect(() => {
     if (sharedText) { setText(sharedText); ingest(sharedText, 'share'); onConsumed(); }
@@ -745,7 +758,7 @@ function Movements({ notifs, toast, sharedText, onConsumed }) {
 /* =====================================================================
    PERMISOS Y CONEXIONES
    ===================================================================== */
-function Permissions({ voiceOn, setVoiceOn, toast, installEvt, session }) {
+function Permissions({ voiceOn, setVoiceOn, toast, installEvt, session, onLogout }) {
   const [state, setState] = useState({});
   const wakeRef = useRef(null);
 
@@ -809,6 +822,10 @@ function Permissions({ voiceOn, setVoiceOn, toast, installEvt, session }) {
         }}>▶️ Probar voz</button>
       </Card>
 
+      {session.role === 'admin' && <UsersAdmin session={session} toast={toast} />}
+      <ChangePassword session={session} toast={toast} />
+
+      {session.role === 'admin' && <>
       <Card delay={0.05}>
         <h3>✉️ Lectura de correos (Gmail)</h3>
         <p className="muted">Android no permite que una app web lea la bandeja de entrada. Por eso un script de Google en tu propia cuenta lee <b>solo</b> los correos de <code>{AUTHORIZED.in}</code> y <code>{AUTHORIZED.out}</code>, verifica la firma DKIM/DMARC de <code>nequi.com.co</code> y los envía a la base de datos al instante.</p>
@@ -829,12 +846,188 @@ function Permissions({ voiceOn, setVoiceOn, toast, installEvt, session }) {
           <li><b>Pegar:</b> copia el SMS y usa “Pegar” en la pestaña Movimientos.</li>
         </ol>
       </Card>
+      </>}
 
       <Card delay={0.15}>
         <div className="row between">
-          <div><div style={{ fontWeight: 700 }}>{session.user.email}</div><div className="muted">Sesión activa</div></div>
-          <button className="btn ghost" onClick={() => supabase.auth.signOut()}>Salir</button>
+          <div>
+            <div style={{ fontWeight: 700 }}>{session.display_name}</div>
+            <div className="muted">@{session.username} · {session.role === 'admin' ? 'Administrador' : 'Trabajador'}</div>
+          </div>
+          <button className="btn ghost" onClick={onLogout}>Salir</button>
         </div>
+      </Card>
+    </div>
+  );
+}
+
+/* =====================================================================
+   USUARIOS (solo admin) Y CAMBIO DE CONTRASEÑA
+   ===================================================================== */
+const EMPTY_USER = { username: '', display_name: '', role: 'trabajador', password: '', active: true, isNew: true };
+
+function UsersAdmin({ session, toast }) {
+  const [users, setUsers] = useState([]);
+  const [form, setForm] = useState(null);
+  const [busy, setBusy] = useState(false);
+
+  const load = useCallback(async () => {
+    try { setUsers(await rpc('list_users', { p_token: session.token })); } catch (e) { toast('⚠️ ' + e.message); }
+  }, [session.token, toast]);
+  useEffect(() => { load(); }, [load]);
+
+  const save = async (e) => {
+    e.preventDefault();
+    setBusy(true);
+    try {
+      await rpc('save_user', {
+        p_token: session.token, p_username: form.username, p_password: form.password || null,
+        p_role: form.role, p_display_name: form.display_name, p_active: form.active,
+      });
+      toast('✅ Usuario guardado');
+      setForm(null);
+      load();
+    } catch (err) { toast('⚠️ ' + err.message); }
+    setBusy(false);
+  };
+  const set = (k) => (e) => setForm((f) => ({ ...f, [k]: e.target.type === 'checkbox' ? e.target.checked : e.target.value }));
+
+  return (
+    <Card delay={0.03}>
+      <div className="row between" style={{ marginBottom: 6 }}>
+        <h3 style={{ margin: 0 }}>👥 Usuarios</h3>
+        <button className="btn ghost" style={{ padding: '8px 12px' }} onClick={() => setForm(form ? null : EMPTY_USER)}>{form ? 'Cerrar' : '+ Nuevo'}</button>
+      </div>
+      <AnimatePresence>
+        {form && (
+          <motion.form onSubmit={save} initial={{ height: 0, opacity: 0 }} animate={{ height: 'auto', opacity: 1 }} exit={{ height: 0, opacity: 0 }} style={{ overflow: 'hidden' }}>
+            <div className="grid two">
+              <div><label className="f">Usuario</label><input required value={form.username} onChange={set('username')} disabled={!form.isNew} autoCapitalize="none" /></div>
+              <div><label className="f">Nombre</label><input value={form.display_name || ''} onChange={set('display_name')} /></div>
+              <div><label className="f">Rol</label>
+                <select value={form.role} onChange={set('role')}><option value="trabajador">Trabajador (caja / validar)</option><option value="admin">Administrador</option></select>
+              </div>
+              <div><label className="f">{form.isNew ? 'Contraseña' : 'Nueva contraseña (opcional)'}</label><input type="password" value={form.password} onChange={set('password')} required={form.isNew} minLength={4} autoComplete="new-password" /></div>
+            </div>
+            <label className="row muted" style={{ marginTop: 12, gap: 8 }}><input type="checkbox" style={{ width: 'auto' }} checked={form.active} onChange={set('active')} /> Activo</label>
+            <button className="btn full" style={{ marginTop: 12 }} disabled={busy}>Guardar</button>
+          </motion.form>
+        )}
+      </AnimatePresence>
+      {users.map((u) => (
+        <div className="perm" key={u.id}>
+          <div className="av" style={{ background: u.role === 'admin' ? 'rgba(255,45,149,.18)' : 'rgba(34,211,238,.15)' }}>{u.role === 'admin' ? '👑' : '🧑‍💼'}</div>
+          <div style={{ flex: 1 }}>
+            <div style={{ fontWeight: 700, fontSize: 14 }}>{u.display_name || u.username} <span className="muted">@{u.username}</span></div>
+            <div className="row" style={{ gap: 6, marginTop: 3 }}>
+              <span className="badge b-mut">{u.role.toUpperCase()}</span>
+              {!u.active && <span className="badge b-bad">INACTIVO</span>}
+              {u.locked && <span className="badge b-warn">BLOQUEADO</span>}
+            </div>
+          </div>
+          <button className="btn ghost" style={{ padding: '8px 12px' }} onClick={() => setForm({ ...u, password: '', isNew: false })}>Editar</button>
+        </div>
+      ))}
+    </Card>
+  );
+}
+
+function ChangePassword({ session, toast }) {
+  const [open, setOpen] = useState(false);
+  const [f, setF] = useState({ old: '', next: '' });
+  const submit = async (e) => {
+    e.preventDefault();
+    try {
+      await rpc('change_password', { p_token: session.token, p_old: f.old, p_new: f.next });
+      toast('✅ Contraseña actualizada'); setOpen(false); setF({ old: '', next: '' });
+    } catch (err) { toast('⚠️ ' + err.message); }
+  };
+  return (
+    <Card delay={0.04}>
+      <div className="row between"><h3 style={{ margin: 0 }}>🔑 Mi contraseña</h3>
+        <button className="btn ghost" style={{ padding: '8px 12px' }} onClick={() => setOpen(!open)}>{open ? 'Cerrar' : 'Cambiar'}</button></div>
+      {open && (
+        <form onSubmit={submit}>
+          <label className="f">Contraseña actual</label><input type="password" required value={f.old} onChange={(e) => setF({ ...f, old: e.target.value })} autoComplete="current-password" />
+          <label className="f">Nueva contraseña</label><input type="password" required minLength={4} value={f.next} onChange={(e) => setF({ ...f, next: e.target.value })} autoComplete="new-password" />
+          <button className="btn full" style={{ marginTop: 12 }}>Guardar</button>
+        </form>
+      )}
+    </Card>
+  );
+}
+
+/* =====================================================================
+   CAJA EN VIVO (vista del trabajador): escuchar y validar pagos
+   ===================================================================== */
+function LiveDesk({ notifs, voiceOn, setVoiceOn, live, goValidate }) {
+  const today = bogota(new Date().toISOString()).date;
+  const todays = notifs.filter((n) => n.direction === 'in' && bogota(n.occurred_at).date === today);
+  const last = todays[0];
+  const total = todays.reduce((s, n) => s + Number(n.amount), 0);
+  const pending = todays.filter((n) => !n.validated).length;
+
+  return (
+    <div className="grid">
+      <Card>
+        <div className="row" style={{ gap: 16 }}>
+          <div style={{ position: 'relative', width: 64, height: 64, flexShrink: 0 }}>
+            {live && voiceOn && [0, 1, 2].map((i) => (
+              <motion.div key={i} style={{ position: 'absolute', inset: 0, borderRadius: '50%', border: '2px solid var(--pink)' }}
+                animate={{ scale: [1, 1.9], opacity: [0.7, 0] }} transition={{ duration: 2.4, repeat: Infinity, delay: i * 0.8 }} />
+            ))}
+            <button onClick={() => { setVoiceOn(!voiceOn); if (!voiceOn) speak('Escuchando pagos'); }}
+              style={{ position: 'absolute', inset: 0, borderRadius: '50%', border: 0, fontSize: 28, cursor: 'pointer', color: '#fff',
+                background: voiceOn ? 'linear-gradient(135deg,var(--pink),var(--violet))' : 'rgba(255,255,255,.1)' }}>
+              {voiceOn ? '🔊' : '🔇'}
+            </button>
+          </div>
+          <div style={{ flex: 1 }}>
+            <div style={{ fontWeight: 800, fontSize: 18 }}>{voiceOn ? 'Escuchando pagos' : 'Voz desactivada'}</div>
+            <div className="muted">{live ? 'Conectado en vivo · ' : 'Reconectando… · '}{voiceOn ? 'Te avisaré con voz cada pago recibido' : 'Toca el botón para activar la voz'}</div>
+          </div>
+        </div>
+      </Card>
+
+      <AnimatePresence mode="wait">
+        {last ? (
+          <motion.div key={last.id} className="card" style={{ textAlign: 'center', padding: 24, background: 'linear-gradient(135deg, rgba(52,211,153,.18), rgba(168,85,247,.12))' }}
+            initial={{ opacity: 0, scale: 0.85, y: 20 }} animate={{ opacity: 1, scale: 1, y: 0 }} exit={{ opacity: 0, scale: 0.9 }} transition={{ type: 'spring', stiffness: 160, damping: 16 }}>
+            <div className="muted" style={{ textTransform: 'uppercase', letterSpacing: '.08em', fontSize: 12 }}>Último pago recibido</div>
+            <motion.div style={{ fontSize: 40, fontWeight: 900, color: 'var(--ok)', margin: '6px 0' }} initial={{ scale: 0.6 }} animate={{ scale: [0.6, 1.12, 1] }} transition={{ duration: 0.6 }}>
+              +{fmtCOP(last.amount)}
+            </motion.div>
+            <div style={{ fontWeight: 700, fontSize: 17 }}>{titleCase(last.counterparty)}</div>
+            <div className="muted">{bogota(last.occurred_at).time} · {last.bank || 'Nequi'}</div>
+            <div className="row" style={{ justifyContent: 'center', gap: 8, marginTop: 10 }}>
+              <Badge n={last} />
+              {last.validated ? <span className="badge b-ok">VALIDADO</span> : <span className="badge b-warn">PENDIENTE DE COMPROBANTE</span>}
+            </div>
+            <div className="row" style={{ marginTop: 16 }}>
+              <button className="btn ghost" style={{ flex: 1 }} onClick={() => speak(voiceText(last))}>🔁 Repetir</button>
+              <button className="btn" style={{ flex: 1 }} onClick={goValidate}>🧾 Validar pantallazo</button>
+            </div>
+          </motion.div>
+        ) : (
+          <motion.div key="empty" className="card" style={{ textAlign: 'center', padding: 28 }} initial={{ opacity: 0 }} animate={{ opacity: 1 }}>
+            <motion.div style={{ fontSize: 44 }} animate={{ scale: [1, 1.1, 1] }} transition={{ duration: 2, repeat: Infinity }}>👂</motion.div>
+            <p style={{ fontWeight: 700, marginTop: 8 }}>Esperando pagos de hoy…</p>
+          </motion.div>
+        )}
+      </AnimatePresence>
+
+      <div className="grid" style={{ gridTemplateColumns: 'repeat(3,1fr)' }}>
+        <Card className="kpi"><div className="lab">Hoy</div><div className="val" style={{ fontSize: 18, color: 'var(--ok)' }}><AnimatedNumber value={total} /></div></Card>
+        <Card className="kpi" delay={0.05}><div className="lab">Pagos</div><div className="val" style={{ fontSize: 18 }}><AnimatedNumber value={todays.length} format={(v) => Math.round(v)} /></div></Card>
+        <Card className="kpi" delay={0.1}><div className="lab">Pendientes</div><div className="val" style={{ fontSize: 18, color: pending ? 'var(--warn)' : 'var(--ok)' }}><AnimatedNumber value={pending} format={(v) => Math.round(v)} /></div></Card>
+      </div>
+
+      <Card delay={0.15}>
+        <h3><span className="pulse" /> Pagos recibidos hoy</h3>
+        {!todays.length && <p className="muted">Aún no hay pagos hoy.</p>}
+        <AnimatePresence initial={false}>
+          {todays.map((n, i) => <MovementRow key={n.id} n={n} i={i} />)}
+        </AnimatePresence>
       </Card>
     </div>
   );
@@ -843,12 +1036,15 @@ function Permissions({ voiceOn, setVoiceOn, toast, installEvt, session }) {
 /* =====================================================================
    APP
    ===================================================================== */
-const TABS = [['dash', '📊', 'Analítica'], ['validate', '🧾', 'Validar'], ['moves', '💳', 'Movimientos'], ['perms', '⚙️', 'Permisos']];
+const TABS = {
+  admin: [['dash', '📊', 'Analítica'], ['desk', '👂', 'Caja'], ['validate', '🧾', 'Validar'], ['moves', '💳', 'Movimientos'], ['perms', '⚙️', 'Ajustes']],
+  trabajador: [['desk', '👂', 'Caja'], ['validate', '🧾', 'Validar'], ['perms', '⚙️', 'Ajustes']],
+};
+const loadSession = () => { try { return JSON.parse(localStorage.getItem('vp-session')) || null; } catch { return null; } };
 
 export default function App() {
-  const [session, setSession] = useState(null);
-  const [ready, setReady] = useState(false);
-  const [tab, setTab] = useState('dash');
+  const [session, setSession] = useState(loadSession);
+  const [tab, setTab] = useState(() => (loadSession()?.role === 'admin' ? 'dash' : 'desk'));
   const [notifs, setNotifs] = useState([]);
   const [vals, setVals] = useState([]);
   const [toasts, setToasts] = useState([]);
@@ -867,17 +1063,30 @@ export default function App() {
     setTimeout(() => setToasts((t) => t.filter((x) => x.id !== id)), 4500);
   }, []);
 
+  const login = (s) => {
+    try { localStorage.setItem('vp-session', JSON.stringify(s)); } catch { /* */ }
+    setSession(s);
+    setTab(s.role === 'admin' ? 'dash' : 'desk');
+  };
+  const logout = useCallback(async (expired) => {
+    const s = loadSession();
+    try { localStorage.removeItem('vp-session'); } catch { /* */ }
+    setSession(null); setNotifs([]); setVals([]);
+    if (expired === true) toast('Tu sesión expiró. Ingresa de nuevo.');
+    else if (s?.token) supabase.rpc('app_logout', { p_token: s.token });
+  }, [toast]);
+
   useEffect(() => {
-    supabase.auth.getSession().then(({ data }) => { setSession(data.session); setReady(true); });
-    const { data: sub } = supabase.auth.onAuthStateChange((_e, s) => setSession(s));
+    const onExpired = () => logout(true);
+    window.addEventListener('vp-logout', onExpired);
     const onInstall = (e) => { e.preventDefault(); setInstallEvt(e); };
     window.addEventListener('beforeinstallprompt', onInstall);
     // Los navegadores exigen un toque antes de hablar: el primer toque desbloquea la voz
     const unlock = () => { if (voiceRef.current) { try { window.speechSynthesis.speak(new SpeechSynthesisUtterance('')); } catch { /* */ } } };
     window.addEventListener('pointerdown', unlock, { once: true });
     window.speechSynthesis?.getVoices();
-    return () => { sub.subscription.unsubscribe(); window.removeEventListener('beforeinstallprompt', onInstall); };
-  }, []);
+    return () => { window.removeEventListener('vp-logout', onExpired); window.removeEventListener('beforeinstallprompt', onInstall); };
+  }, [logout]);
 
   // Contenido compartido desde Android (share target)
   useEffect(() => {
@@ -890,7 +1099,7 @@ export default function App() {
         const blob = await img.blob();
         setSharedFile(new File([blob], 'compartido.png', { type: blob.type }));
         setTab('validate');
-      } else if (txt) {
+      } else if (txt && session.role === 'admin') {
         setSharedText(await txt.text());
         setTab('moves');
       }
@@ -907,38 +1116,37 @@ export default function App() {
     toast((n.direction === 'in' ? '💰 ' : '💸 ') + text);
   }, [toast]);
 
-  const load = useCallback(async () => {
-    const since = new Date(Date.now() - 90 * 864e5).toISOString();
-    const [n, v] = await Promise.all([
-      supabase.from('notifications').select('*').gte('occurred_at', since).order('occurred_at', { ascending: false }).limit(3000),
-      supabase.from('validations').select('id,status,score,amount,payer_name,reference,notification_id,created_at').gte('created_at', since).order('created_at', { ascending: false }).limit(2000),
-    ]);
-    if (n.error) toast('Error cargando datos: ' + n.error.message);
-    setNotifs(n.data || []); setVals(v.data || []);
-  }, [toast]);
-
+  // Sincronización en vivo: consulta cambios cada 4 s (15 s en segundo plano)
   useEffect(() => {
-    if (!session) return;
-    load();
-    const ch = supabase.channel('vp-live')
-      .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'notifications' }, ({ new: n }) => {
-        setNotifs((p) => [n, ...p.filter((x) => x.id !== n.id)].sort((a, b) => b.occurred_at.localeCompare(a.occurred_at)));
-        announce(n);
-      })
-      .on('postgres_changes', { event: 'UPDATE', schema: 'public', table: 'notifications' }, ({ new: n }) => {
-        setNotifs((p) => p.map((x) => (x.id === n.id ? n : x)));
-      })
-      .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'validations' }, ({ new: v }) => {
-        setVals((p) => [v, ...p.filter((x) => x.id !== v.id)]);
-      })
-      .subscribe((s) => setLive(s === 'SUBSCRIBED'));
-    const onVis = () => { if (document.visibilityState === 'visible') load(); };
-    document.addEventListener('visibilitychange', onVis);
-    return () => { supabase.removeChannel(ch); document.removeEventListener('visibilitychange', onVis); };
-  }, [session, load, announce]);
+    if (!session) return undefined;
+    let cursor = null;
+    let first = true;
+    let stopped = false;
+    let timer;
+    const seen = new Set();
+    const tick = async () => {
+      try {
+        const d = await rpc('sync', { p_token: session.token, p_cursor: cursor });
+        cursor = new Date(new Date(d.server_time).getTime() - 15000).toISOString();
+        const ns = d.notifications || [];
+        if (ns.length) setNotifs((p) => mergeById(p, ns, 'occurred_at'));
+        if (d.validations?.length) setVals((p) => mergeById(p, d.validations, 'created_at'));
+        if (!first) {
+          ns.filter((n) => !seen.has(n.id) && Date.now() - new Date(n.created_at).getTime() < 10 * 60000).forEach(announce);
+        }
+        ns.forEach((n) => seen.add(n.id));
+        first = false;
+        setLive(true);
+      } catch { setLive(false); }
+      if (!stopped) timer = setTimeout(tick, document.visibilityState === 'visible' ? 4000 : 15000);
+    };
+    tick();
+    return () => { stopped = true; clearTimeout(timer); };
+  }, [session, announce]);
 
   const consumeFile = useCallback(() => setSharedFile(null), []);
   const consumeText = useCallback(() => setSharedText(''), []);
+  const tabs = session ? TABS[session.role] || TABS.trabajador : [];
 
   return (
     <>
@@ -952,27 +1160,28 @@ export default function App() {
         </AnimatePresence>
       </div>
 
-      {!ready ? null : !session ? <Login /> : (
+      {!session ? <Login onLogin={login} /> : (
         <div className="wrap">
           <div className="top">
             <div className="brand">
               <motion.div className="logo" whileTap={{ rotate: 360 }} transition={{ duration: 0.6 }}>✓</motion.div>
-              <div>Validar Pagos<div className="muted" style={{ fontWeight: 400, fontSize: 12 }}>{live ? 'En vivo' : 'Conectando…'} · Nequi</div></div>
+              <div>Validar Pagos<div className="muted" style={{ fontWeight: 400, fontSize: 12 }}>{live ? '● En vivo' : 'Conectando…'} · {session.display_name}</div></div>
             </div>
             <button className="chip" onClick={() => { setVoiceOn(!voiceOn); if (!voiceOn) speak('Voz activada'); }}>{voiceOn ? '🔊 Voz' : '🔇 Voz'}</button>
           </div>
 
           <AnimatePresence mode="wait">
             <motion.div key={tab} initial={{ opacity: 0, y: 12 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: -12 }} transition={{ duration: 0.2 }}>
-              {tab === 'dash' && <Dashboard notifs={notifs} vals={vals} />}
-              {tab === 'validate' && <Validator sharedFile={sharedFile} onConsumed={consumeFile} toast={toast} />}
-              {tab === 'moves' && <Movements notifs={notifs} toast={toast} sharedText={sharedText} onConsumed={consumeText} />}
-              {tab === 'perms' && <Permissions voiceOn={voiceOn} setVoiceOn={setVoiceOn} toast={toast} installEvt={installEvt} session={session} />}
+              {tab === 'dash' && session.role === 'admin' && <Dashboard notifs={notifs} vals={vals} />}
+              {tab === 'desk' && <LiveDesk notifs={notifs} voiceOn={voiceOn} setVoiceOn={setVoiceOn} live={live} goValidate={() => setTab('validate')} />}
+              {tab === 'validate' && <Validator session={session} sharedFile={sharedFile} onConsumed={consumeFile} toast={toast} />}
+              {tab === 'moves' && session.role === 'admin' && <Movements session={session} notifs={notifs} toast={toast} sharedText={sharedText} onConsumed={consumeText} />}
+              {tab === 'perms' && <Permissions voiceOn={voiceOn} setVoiceOn={setVoiceOn} toast={toast} installEvt={installEvt} session={session} onLogout={logout} />}
             </motion.div>
           </AnimatePresence>
 
           <nav className="nav">
-            {TABS.map(([k, ic, l]) => (
+            {tabs.map(([k, ic, l]) => (
               <button key={k} className={tab === k ? 'on' : ''} onClick={() => setTab(k)}>
                 {tab === k && <motion.div layoutId="pill" className="pill" transition={{ type: 'spring', stiffness: 400, damping: 30 }} />}
                 <span className="ic">{ic}</span>{l}
