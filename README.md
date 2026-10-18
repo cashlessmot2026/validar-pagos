@@ -28,7 +28,7 @@ PWA en React para validar pagos recibidos por Nequi **sin usar APIs de bancos**.
 - Las contraseñas se guardan cifradas (bcrypt). Tras 5 intentos fallidos el usuario se bloquea 5 minutos. **Cambia las contraseñas `1234`** desde Ajustes.
 
 ## Instalación
-1. **Base de datos.** En Supabase abre SQL Editor y ejecuta, en este orden, `supabase/schema.sql` y `supabase/02_usuarios_roles.sql`.
+1. **Base de datos.** En Supabase abre SQL Editor y ejecuta, en este orden, `supabase/schema.sql`, `supabase/02_usuarios_roles.sql` y `supabase/03_validar_pagos_realizados.sql`.
 2. **Usuarios.** Ya quedan creados `admin` y `v`. Puedes crear más trabajadores en Ajustes → Usuarios.
 3. **Gmail.** Sigue las instrucciones del archivo `integraciones/gmail-apps-script.gs`. El secreto se obtiene con:
    ```sql

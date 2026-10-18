@@ -87,14 +87,26 @@ const parseMoney = (s) => {
 
 /* Lee el texto OCR del pantallazo del comprobante */
 function parseReceipt(raw) {
-  const text = (raw || '').replace(/\r/g, '');
+  // La primera línea suele ser la barra de estado del celular ("1:33 ... 28%"): se quita su hora
+  const text = (raw || '').replace(/\r/g, '').replace(/^\s*\d{1,2}:\d{2}\b[^\n]*\n/, '\n');
   const flat = text.replace(/\s+/g, ' ');
-  const out = { amount: '', name: '', date: '', time: '', reference: '' };
+  const out = { direction: 'in', amount: '', name: '', date: '', time: '', reference: '' };
+  const MONEY = '([0-9]{1,3}(?:[.\\s][0-9]{3})+(?:,[0-9]{2})?|[0-9]+(?:,[0-9]{2})?)';
 
-  const labeled = flat.match(/(?:¿?cu[aá]nto\??|valor|monto|total)\s*:?\s*(?:\$|S)\s?([0-9]{1,3}(?:[.\s][0-9]{3})+(?:,[0-9]{2})?|[0-9]+(?:,[0-9]{2})?)/i);
+  if (!/recibiste/i.test(flat) && /(hiciste un pago|pago exitoso|enviaste|pagaste|transferiste|compraste)/i.test(flat)) out.direction = 'out';
+
+  // Plantillas de Nequi: "Recibiste 70.000 de …", "Hiciste un pago en … por $41.649", "Enviaste $X a …"
+  const nequi = flat.match(new RegExp(`(?:recibiste|enviaste|pagaste|transferiste)\\s+\\$?\\s?${MONEY}\\s+(?:de|a)\\s`, 'i'))
+    || flat.match(new RegExp(`pago en .+? por\\s+\\$?\\s?${MONEY}`, 'i'));
+  const labeled = flat.match(new RegExp(`(?:¿?cu[aá]nto\\??|valor|monto|total)\\s*:?\\s*(?:\\$|S)\\s?${MONEY}`, 'i'));
   const all = [...flat.matchAll(/\$\s?([0-9]{1,3}(?:[.\s][0-9]{3})+(?:,[0-9]{2})?|[0-9]{4,}(?:,[0-9]{2})?)/g)].map((m) => parseMoney(m[1]));
-  const amount = labeled ? parseMoney(labeled[1]) : (all.length ? Math.max(...all) : null);
+  const amount = nequi ? parseMoney(nequi[1]) : labeled ? parseMoney(labeled[1]) : (all.length ? Math.max(...all) : null);
   if (amount) out.amount = String(amount);
+
+  const who = flat.match(/recibiste\s+\$?\s?[0-9][0-9.,]*\s+de\s+([^0-9]+?)\s+el\s+\d/i)
+    || flat.match(/pago en\s+(.+?)\s+por\s+\$/i)
+    || flat.match(/(?:enviaste|pagaste|transferiste)\s+\$?\s?[0-9][0-9.,]*\s+a\s+([^0-9]+?)\s+el\s+\d/i);
+  if (who) out.name = who[1].trim();
 
   const d = flat.match(/(\d{1,2})\s+(?:de\s+)?([a-záéíóú]{3,})\.?\s+(?:de\s+)?(\d{4})/i);
   if (d && MONTHS[norm(d[2]).slice(0, 3).toLowerCase()]) {
@@ -117,7 +129,7 @@ function parseReceipt(raw) {
   if (r) out.reference = r[1].toUpperCase();
 
   const lines = text.split('\n').map((l) => l.trim()).filter(Boolean);
-  for (let i = 0; i < lines.length; i++) {
+  for (let i = 0; i < lines.length && !out.name; i++) {
     const m = lines[i].match(/^(?:de|para|nombre|remitente|enviado por|origen|qui[eé]n env[ií]a)\s*:?\s*(.*)$/i);
     if (m) {
       const cand = (m[1] && /[a-z]{3,}/i.test(m[1]) ? m[1] : lines[i + 1]) || '';
@@ -503,7 +515,7 @@ function Validator({ session, sharedFile, onConsumed, toast }) {
   const [progress, setProgress] = useState(0);
   const [ocrText, setOcrText] = useState('');
   const [hash, setHash] = useState('');
-  const [fields, setFields] = useState({ amount: '', name: '', date: '', time: '', reference: '' });
+  const [fields, setFields] = useState({ direction: 'in', amount: '', name: '', date: '', time: '', reference: '' });
   const [result, setResult] = useState(null);
   const [busy, setBusy] = useState(false);
   const pickRef = useRef(null);
@@ -517,11 +529,17 @@ function Validator({ session, sharedFile, onConsumed, toast }) {
       return;
     }
     const minute = new Date(occurredISO).getTime();
+    const dir = f.direction === 'out' ? 'out' : 'in';
+    const kind = dir === 'in' ? 'pago recibido' : 'pago realizado';
+    if (dir === 'out' && !isAdmin) {
+      setResult({ status: 'rechazado', score: 0, checks: [{ ok: false, t: 'No es un pago recibido', d: 'El pantallazo es de dinero que salió de la cuenta (“Hiciste un pago”). Solo el administrador valida pagos realizados.' }] });
+      return;
+    }
 
     let lookup;
     try {
       lookup = await rpc('validation_lookup', {
-        p_token: session.token, p_amount: amount, p_occurred_at: occurredISO,
+        p_token: session.token, p_direction: dir, p_amount: amount, p_occurred_at: occurredISO,
         p_image_hash: imgHash || null, p_reference: f.reference || null,
       });
     } catch (e) { toast('Error consultando: ' + e.message); return; }
@@ -536,16 +554,16 @@ function Validator({ session, sharedFile, onConsumed, toast }) {
 
     const checks = [];
     checks.push(!best
-      ? { ok: false, t: 'Notificación de Nequi', d: `No hay un pago recibido de ${fmtCOP(amount)} cerca de ${f.time}` }
+      ? { ok: false, t: 'Notificación de Nequi', d: `No hay un ${kind} de ${fmtCOP(amount)} cerca de ${f.time}` }
       : best.n.verified
-        ? { ok: true, t: 'Origen de la notificación', d: `Correo de ${AUTHORIZED.in} con firma DKIM/DMARC válida` }
+        ? { ok: true, t: 'Origen de la notificación', d: `Correo de ${AUTHORIZED[dir]} con firma DKIM/DMARC válida` }
         : best.n.trusted
           ? { ok: null, t: 'Origen de la notificación', d: 'Confirmado por SMS de Nequi; el correo verificado aún no llega' }
           : { ok: isAdmin ? null : false, t: 'Origen de la notificación', d: 'Registrado manualmente, sin confirmación oficial de Nequi todavía' });
     if (best) {
       checks.push({ ok: Number(best.n.amount) === amount, t: 'Valor exacto', d: `Comprobante ${fmtCOP(amount)} · Nequi ${fmtCOP(best.n.amount)}` });
       checks.push({ ok: best.exact, t: 'Hora exacta', d: `Comprobante ${f.date} ${f.time} · Nequi ${bogota(best.n.occurred_at).date} ${bogota(best.n.occurred_at).time}` });
-      checks.push({ ok: best.name >= 0.6 ? true : best.name > 0 ? null : false, t: 'Nombre del pagador',
+      checks.push({ ok: best.name >= 0.6 ? true : best.name > 0 ? null : false, t: dir === 'in' ? 'Nombre del pagador' : 'Nombre del beneficiario',
         d: `${titleCase(best.n.counterparty)} · coincidencia ${Math.round(best.name * 100)}%` });
       checks.push({ ok: !best.n.validated, t: 'Pago no usado antes', d: best.n.validated ? 'Este pago ya fue validado con otro comprobante' : 'Disponible' });
       if (best.n.reference && f.reference) {
@@ -554,7 +572,9 @@ function Validator({ session, sharedFile, onConsumed, toast }) {
     }
     checks.push(f.reference
       ? { ok: !dupRef, t: 'Número de movimiento único', d: dupRef ? `${f.reference} ya fue usado` : `${f.reference} no se ha usado` }
-      : { ok: null, t: 'Número de movimiento', d: 'No se detectó en el pantallazo' });
+      : best && !best.n.reference
+        ? { ok: true, t: 'Número de movimiento', d: 'Nequi no incluye número de movimiento en este aviso; se controla con el pago único' }
+        : { ok: null, t: 'Número de movimiento', d: 'No se detectó en el pantallazo' });
     checks.push({ ok: !dupImg, t: 'Pantallazo nuevo', d: dupImg ? 'Esta misma imagen ya fue presentada' : 'Imagen nunca antes usada' });
 
     const hardFail = checks.some((c) => c.ok === false);
@@ -608,7 +628,7 @@ function Validator({ session, sharedFile, onConsumed, toast }) {
     if (error) { toast('⚠️ ' + error.message); return; }
     toast(status === 'aprobado' ? '✅ Pago validado y registrado' : '📝 Validación registrada como ' + status);
     if (status === 'aprobado') speak(`Pago validado. ${voiceText(result.best)}`);
-    setFile(null); setPreview(''); setResult(null); setOcrText(''); setFields({ amount: '', name: '', date: '', time: '', reference: '' });
+    setFile(null); setPreview(''); setResult(null); setOcrText(''); setFields({ direction: 'in', amount: '', name: '', date: '', time: '', reference: '' });
   };
 
   const set = (k) => (e) => setFields((p) => ({ ...p, [k]: e.target.value }));
@@ -619,7 +639,7 @@ function Validator({ session, sharedFile, onConsumed, toast }) {
       <Card>
         <h3>🧾 Validar pantallazo de pago</h3>
         <p className="muted" style={{ marginBottom: 12 }}>
-          Se compara con la notificación oficial de <code>{AUTHORIZED.in}</code>: valor exacto, hora exacta, nombre y número de movimiento.
+          Pagos recibidos se comparan con <code>{AUTHORIZED.in}</code> y pagos realizados con <code>{AUTHORIZED.out}</code>: valor exacto, hora exacta, nombre y número de movimiento.
         </p>
         {!preview ? (
           <motion.div className="drop" whileHover={{ scale: 1.01 }} whileTap={{ scale: 0.98 }} onClick={() => pickRef.current?.click()}
@@ -648,9 +668,14 @@ function Validator({ session, sharedFile, onConsumed, toast }) {
       {ocrText && (
         <Card delay={0.05}>
           <h3>✏️ Datos detectados <span className="muted">(corrige si es necesario)</span></h3>
+          <div className="chips" style={{ marginBottom: 4 }}>
+            {[['in', '⬇️ Pago recibido'], ...(isAdmin ? [['out', '⬆️ Pago realizado']] : [])].map(([k, l]) => (
+              <button key={k} className={`chip ${fields.direction === k ? 'on' : ''}`} onClick={() => { const nf = { ...fields, direction: k }; setFields(nf); verify(nf, hash, ocrText); }}>{l}</button>
+            ))}
+          </div>
           <div className="grid two">
             <div><label className="f">Valor exacto (COP)</label><input inputMode="decimal" value={fields.amount} onChange={set('amount')} /></div>
-            <div><label className="f">Nombre del pagador</label><input value={fields.name} onChange={set('name')} /></div>
+            <div><label className="f">{fields.direction === 'out' ? 'Pagado a' : 'Nombre del pagador'}</label><input value={fields.name} onChange={set('name')} /></div>
             <div><label className="f">Fecha</label><input type="date" value={fields.date} onChange={set('date')} /></div>
             <div><label className="f">Hora exacta</label><input type="time" value={fields.time} onChange={set('time')} /></div>
             <div><label className="f">Número de movimiento / referencia</label><input value={fields.reference} onChange={set('reference')} /></div>
