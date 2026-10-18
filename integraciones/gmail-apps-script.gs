@@ -4,7 +4,8 @@
  * 1. Abre https://script.google.com con la cuenta Gmail que recibe los correos de Nequi.
  * 2. Nuevo proyecto, pega este archivo y reemplaza INGEST_SECRET con el valor de:
  *      select value from public.app_config where key = 'ingest_secret';
- * 3. Ejecuta una vez `instalarActivador` (acepta los permisos de Gmail).
+ * 3. (Opcional) Editor > Servicios > + > "Gmail API" > Agregar.
+ * 4. Ejecuta una vez `instalarActivador` (acepta los permisos de Gmail).
  *    Desde ese momento revisa el correo cada minuto.
  *
  * Solo procesa correos cuyo remitente sea exactamente uno de los autorizados y
@@ -29,7 +30,7 @@ function procesarCorreosNequi() {
       const email = ((from.match(/<([^>]+)>/) || [])[1] || from).trim().toLowerCase();
       if (SENDERS.indexOf(email) === -1) return; // dominio/remitente no autorizado
 
-      const auth = msg.getHeader('Authentication-Results') || '';
+      const auth = authResults(msg);
       const dkimNequi = /dkim=pass[^;]*header\.(?:d|i)=@?(?:[\w-]+\.)*nequi\.com\.co/i.test(auth);
       const dmarcNequi = /dmarc=pass[^;]*header\.from=(?:[\w-]+\.)*nequi\.com\.co/i.test(auth);
 
@@ -53,6 +54,35 @@ function procesarCorreosNequi() {
     });
     if (allOk) thread.addLabel(label);
   });
+}
+
+/**
+ * Resultado DKIM/SPF/DMARC que agregó Gmail al recibir el mensaje.
+ * Solo vale el PRIMER encabezado Authentication-Results y debe ser de mx.google.com:
+ * los que vengan más abajo pudo escribirlos el remitente para falsificar la firma.
+ * Si el servicio avanzado "Gmail API" está activado (Editor > Servicios > Gmail API)
+ * se usa ese, que garantiza el orden de los encabezados; si no, GmailApp.
+ */
+function authResults(msg) {
+  let value = '';
+  if (typeof Gmail !== 'undefined') {
+    try {
+      const full = Gmail.Users.Messages.get('me', msg.getId(), {
+        format: 'metadata',
+        metadataHeaders: ['Authentication-Results'],
+      });
+      const first = (full.payload.headers || []).filter(function (h) {
+        return h.name.toLowerCase() === 'authentication-results';
+      })[0];
+      value = first ? first.value : '';
+    } catch (err) {
+      Logger.log('Gmail API no disponible, uso GmailApp: ' + err);
+      value = msg.getHeader('Authentication-Results') || '';
+    }
+  } else {
+    value = msg.getHeader('Authentication-Results') || '';
+  }
+  return /^\s*mx\.google\.com\s*;/i.test(value) ? value : '';
 }
 
 function instalarActivador() {
