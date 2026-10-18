@@ -1,9 +1,9 @@
-const SHELL = 'vp-shell-v1';
+const SHELL = 'vp-shell-v2';
 const INBOX = 'share-inbox';
 
 self.addEventListener('install', (e) => {
   self.skipWaiting();
-  e.waitUntil(caches.open(SHELL).then((c) => c.addAll(['/', '/manifest.webmanifest', '/icon-192.png', '/icon-512.png'])));
+  e.waitUntil(caches.open(SHELL).then((c) => c.addAll(['./', './manifest.webmanifest', './icon-192.png', './icon-512.png'])));
 });
 
 self.addEventListener('activate', (e) => {
@@ -16,13 +16,13 @@ self.addEventListener('activate', (e) => {
 
 self.addEventListener('fetch', (e) => {
   const url = new URL(e.request.url);
-  if (e.request.method === 'POST' && url.pathname === '/share-target') {
+  if (e.request.method === 'POST' && url.pathname.endsWith('/share-target')) {
     e.respondWith(handleShare(e.request));
     return;
   }
   if (e.request.method !== 'GET' || url.origin !== self.location.origin) return;
   if (e.request.mode === 'navigate') {
-    e.respondWith(fetch(e.request).catch(() => caches.match('/')));
+    e.respondWith(fetch(e.request).catch(() => caches.match(self.registration.scope)));
     return;
   }
   e.respondWith(
@@ -46,12 +46,12 @@ async function handleShare(request) {
     await inbox.put('/shared/image', new Response(file, { headers: { 'content-type': file.type || 'image/png' } }));
   }
   if (text) await inbox.put('/shared/text', new Response(text));
-  return Response.redirect('/?share=1', 303);
+  return Response.redirect(self.registration.scope + '?share=1', 303);
 }
 
 self.addEventListener('notificationclick', (e) => {
   e.notification.close();
   e.waitUntil(
-    self.clients.matchAll({ type: 'window' }).then((list) => (list[0] ? list[0].focus() : self.clients.openWindow('/')))
+    self.clients.matchAll({ type: 'window' }).then((list) => (list[0] ? list[0].focus() : self.clients.openWindow(self.registration.scope)))
   );
 });

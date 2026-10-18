@@ -149,8 +149,8 @@ async function systemNotify(title, body) {
   try {
     if (!('Notification' in window) || Notification.permission !== 'granted') return;
     const reg = await navigator.serviceWorker?.getRegistration();
-    if (reg) reg.showNotification(title, { body, icon: '/icon-192.png', badge: '/icon-192.png', vibrate: [200, 100, 200] });
-    else new Notification(title, { body, icon: '/icon-192.png' });
+    if (reg) reg.showNotification(title, { body, icon: './icon-192.png', badge: './icon-192.png', vibrate: [200, 100, 200] });
+    else new Notification(title, { body, icon: './icon-192.png' });
   } catch { /* ignorar */ }
 }
 
@@ -1104,7 +1104,7 @@ export default function App() {
         setTab('moves');
       }
       await inbox.delete('/shared/image'); await inbox.delete('/shared/text');
-      history.replaceState(null, '', '/');
+      history.replaceState(null, '', location.pathname);
     })();
   }, [session]);
 
